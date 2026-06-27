@@ -522,17 +522,21 @@
 </footer>
 
 <script>
-  /* ── Speech recognition ── */
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-  let rec = null, active = false, finalText = '', lang = 'hi-IN';
+  let rec          = null;
+  let active       = false;
+  let finalText    = '';
+  let lang         = 'hi-IN';
+  let restartTimer = null;
 
   /*
-   * restartTimer — tracks the pending auto-restart from rec.onend.
-   * Cancelling it before any manual action prevents a second recognizer
-   * from spawning alongside one the user just started, which was the
-   * root cause of every word appearing twice.
+   * Android Chrome replays the last phrase at the start of each new
+   * recognition session. We catch this by remembering the last text
+   * added and the time it was added. If the exact same text arrives
+   * again within 2 seconds, we silently drop it.
    */
-  let restartTimer = null;
+  let lastAddedText = '';
+  let lastAddedTime = 0;
 
   function setup() {
     if (!SR) {
@@ -542,15 +546,41 @@
       setStatus(false, 'Browser not supported — open in Chrome or Edge');
       return false;
     }
+
     rec = new SR();
-    rec.continuous = true; rec.interimResults = true;
-    rec.maxAlternatives = 1; rec.lang = lang;
+    /*
+     * continuous = false  ← key Android fix.
+     * With continuous: true, Chrome on Android accumulates results across
+     * restarts and can fire them again. With continuous: false every session
+     * handles exactly one utterance with its own clean result list, then
+     * onend fires and we restart for the next utterance. Far more reliable
+     * on mobile.
+     */
+    rec.continuous      = false;
+    rec.interimResults  = true;
+    rec.maxAlternatives = 1;
+    rec.lang            = lang;
 
     rec.onresult = (e) => {
       let interim = '';
-      for (let i = e.resultIndex; i < e.results.length; i++) {
-        if (e.results[i].isFinal) finalText += e.results[i][0].transcript + ' ';
-        else                       interim   += e.results[i][0].transcript;
+      for (let i = 0; i < e.results.length; i++) {
+        if (e.results[i].isFinal) {
+          const text = e.results[i][0].transcript.trim();
+          const now  = Date.now();
+          /*
+           * Deduplication: Android sometimes sends the same final result
+           * twice — once in the session that recognised it, and once at
+           * the start of the restarted session. Drop it if identical text
+           * was added less than 2 seconds ago.
+           */
+          if (text && (text !== lastAddedText || now - lastAddedTime > 2000)) {
+            finalText    += text + ' ';
+            lastAddedText = text;
+            lastAddedTime = now;
+          }
+        } else {
+          interim += e.results[i][0].transcript;
+        }
       }
       render(finalText, interim);
     };
@@ -566,15 +596,17 @@
     };
 
     rec.onend = () => {
-      /* Auto-restart only if still active — and track the timer so it
-         can be cancelled if the user manually presses Stop or Start. */
+      /* Clear any dangling interim text when the utterance session ends */
+      render(finalText, '');
       if (active) {
+        /* Track the timer so we can cancel it if the user acts first */
         restartTimer = setTimeout(() => {
           restartTimer = null;
           try { if (rec) rec.start(); } catch (_) {}
-        }, 250);
+        }, 150);
       }
     };
+
     return true;
   }
 
@@ -589,22 +621,24 @@
   function toggleListen() {
     if (!rec && !setup()) return;
 
-    /* Always cancel any pending auto-restart before taking manual action.
-       This is the core fix — without this, the timer fires after the user
-       has already started a new session, creating two listeners at once. */
+    /* Cancel any pending auto-restart before taking manual action */
     clearTimeout(restartTimer);
     restartTimer = null;
 
     if (active) {
       active = false;
       try { rec.stop(); } catch (_) {}
+      render(finalText, '');
       setStatus(false, lang === 'hi-IN' ? 'रुका हुआ — फिर दबाएँ' : 'Stopped — tap Start again');
     } else {
-      finalText = ''; render('', '');
-      active = true; rec.lang = lang;
-      /* If start() throws (rare), the existing session is already running —
-         just leave it. Do NOT create a new rec object here, which was the
-         original bug: two rec instances → same speech heard twice. */
+      /* Reset everything for a fresh start */
+      finalText     = '';
+      lastAddedText = '';
+      lastAddedTime = 0;
+      render('', '');
+      active   = true;
+      rec.lang = lang;
+      /* If start() throws the session is already running — just leave it */
       try { rec.start(); } catch (_) {}
       setStatus(true, lang === 'hi-IN' ? 'सुन रहा है...' : 'Listening...');
     }
@@ -640,7 +674,9 @@
     document.getElementById('enBtn').className = 'lang-pill' + (code === 'en' ? ' active' : '');
     if (active && rec) {
       clearTimeout(restartTimer);
-      restartTimer = null;
+      restartTimer  = null;
+      lastAddedText = '';
+      lastAddedTime = 0;
       try { rec.stop(); } catch (_) {}
       finalText = ''; render('', '');
       setTimeout(() => {
@@ -665,7 +701,6 @@
     else document.exitFullscreen().catch(() => {});
   }
 
-  /* ── Photo upload: resize + center-crop to 240×240 ── */
   function handlePhoto(input) {
     const file = input.files[0];
     if (!file) return;
@@ -677,9 +712,7 @@
         canvas.width = canvas.height = 240;
         const ctx = canvas.getContext('2d');
         const min = Math.min(img.width, img.height);
-        const sx  = (img.width  - min) / 2;
-        const sy  = (img.height - min) / 2;
-        ctx.drawImage(img, sx, sy, min, min, 0, 0, 240, 240);
+        ctx.drawImage(img, (img.width-min)/2, (img.height-min)/2, min, min, 0, 0, 240, 240);
         const dataUrl = canvas.toDataURL('image/jpeg', 0.88);
         applyPhoto(dataUrl);
         try { localStorage.setItem('dadaji_photo', dataUrl); } catch (_) {}
@@ -697,21 +730,18 @@
     document.getElementById('photoPlaceholder').style.display = 'none';
   }
 
-  /* ── Name save ── */
   function saveName(el) {
     let name = el.textContent.trim();
     if (!name) { el.textContent = 'दादाजी'; name = 'दादाजी'; }
     try { localStorage.setItem('dadaji_name', name); } catch (_) {}
   }
 
-  /* Strip HTML on paste — only allow plain text in name */
   document.getElementById('dadaName').addEventListener('paste', (e) => {
     e.preventDefault();
-    const text = (e.clipboardData || window.clipboardData).getData('text/plain');
-    document.execCommand('insertText', false, text);
+    document.execCommand('insertText', false,
+      (e.clipboardData || window.clipboardData).getData('text/plain'));
   });
 
-  /* ── Restore saved photo & name on load ── */
   try {
     const savedPhoto = localStorage.getItem('dadaji_photo');
     if (savedPhoto) applyPhoto(savedPhoto);
@@ -719,7 +749,6 @@
     if (savedName) document.getElementById('dadaName').textContent = savedName;
   } catch (_) {}
 
-  /* ── Speech data clears on close; photo & name persist ── */
   window.addEventListener('beforeunload', () => {
     active = false;
     clearTimeout(restartTimer);
